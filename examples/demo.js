@@ -198,6 +198,152 @@ const log = (label, data) => {
     .exec();
   log('17. aggregate("episode") -- count episodes per season', aggFiltered);
 
+  // -----------------------------------------------------------------------
+  // 18. Scalar type utilities (Feature 2)
+  // -----------------------------------------------------------------------
+  log('18. Scalar type utilities', {
+    'getActualScalarType("SeasonNumber_Int")': client.getActualScalarType('SeasonNumber_Int'),
+    'getActualScalarType("StartDate_Date")': client.getActualScalarType('StartDate_Date'),
+    'isNumericScalar("SeasonNumber_Int")': client.isNumericScalar('SeasonNumber_Int'),
+    'isNumericScalar("String")': client.isNumericScalar('String'),
+    'isBooleanScalar("Boolean")': client.isBooleanScalar('Boolean'),
+    'isDateTimeScalar("EpisodeDate_DateTime")': client.isDateTimeScalar('EpisodeDate_DateTime'),
+    'isDateTimeScalar("Int")': client.isDateTimeScalar('Int'),
+  });
+
+  // -----------------------------------------------------------------------
+  // 19. Schema metadata access (Feature 3)
+  // -----------------------------------------------------------------------
+  const serieType = client.getTypes()['serie'] ? 'serie' : 'Serie';
+  const serieFields = client.getFieldsOfType(serieType);
+  log('19. Schema metadata -- getFieldsOfType(' + serieType + ')', serieFields.map(f => ({
+    name: f.name,
+    kind: f.type.kind,
+    typeName: f.type.name,
+    extensions: f.extensions,
+  })));
+
+  const objectFields = serieFields.filter(f => f.type.kind === 'OBJECT');
+  if (objectFields.length > 0) {
+    const objField = objectFields[0];
+    log('19b. Schema metadata -- extensions for ' + serieType + '.' + objField.name, {
+      extensions: client.getFieldExtensions(serieType, objField.name),
+      displayField: client.getDisplayField(serieType, objField.name),
+      isEmbedded: client.isEmbeddedField(serieType, objField.name),
+      connectionField: client.getConnectionField(serieType, objField.name),
+      isStateMachine: client.isStateMachineField(serieType, objField.name),
+      isReadOnly: client.isReadOnlyField(serieType, objField.name),
+    });
+  }
+
+  // -----------------------------------------------------------------------
+  // 20. buildSelectionSet / autoSelect (Feature 4)
+  // -----------------------------------------------------------------------
+  const selSet = client.buildSelectionSet(serieType);
+  log('20. buildSelectionSet(' + serieType + ')', selSet);
+
+  const autoSelectResult = await client.find(serieType)
+    .autoSelect()
+    .page(1, 2)
+    .exec();
+  log('20b. find().autoSelect().page(1,2).exec()', autoSelectResult);
+
+  // -----------------------------------------------------------------------
+  // 21. Entity & query name resolution (Feature 5)
+  // -----------------------------------------------------------------------
+  log('21. Entity & query name resolution', {
+    listEntityNames: client.getListEntityNames(),
+    'getQueryNamesForType(serieType)': client.getQueryNamesForType(serieType),
+    'getPluralQueryName(serieType)': client.getPluralQueryName(serieType),
+    'getSingularQueryName(serieType)': client.getSingularQueryName(serieType),
+  });
+
+  const pluralName = client.getPluralQueryName(serieType);
+  if (pluralName) {
+    log('21b. getTypeNameForQuery("' + pluralName + '")',
+      client.getTypeNameForQuery(pluralName));
+  }
+
+  // -----------------------------------------------------------------------
+  // 22. transformInput (Feature 6)
+  // -----------------------------------------------------------------------
+  const rawInput = {
+    name: 'Test Serie',
+    categories: 'Drama',
+    year: '2025',
+    __typename: 'Serie',
+    director: { id: 'dir-123', name: 'Some Director', __typename: 'Director' },
+  };
+  const transformed = client.transformInput(serieType, rawInput, { mode: 'create' });
+  log('22. transformInput -- raw vs transformed', { rawInput, transformed });
+
+  // -----------------------------------------------------------------------
+  // 23. transformCollectionDelta (Feature 7)
+  // -----------------------------------------------------------------------
+  const seasonType = client.getTypes()['season'] ? 'season' : 'Season';
+  const delta = {
+    added: [
+      { id: 'temp_1', number: '3', year: '2025', __typename: 'Season', __status: 'added' },
+    ],
+    updated: [
+      { id: 'real-id-1', number: '2', year: '2024', __status: 'modified' },
+    ],
+    deleted: [
+      { id: 'del-id-1' },
+    ],
+  };
+  const connectionField = client.getConnectionField(serieType, 'seasons');
+  const transformedDelta = client.transformCollectionDelta(seasonType, delta, {
+    connectionField: connectionField || 'serie',
+  });
+  log('23. transformCollectionDelta', { delta, transformedDelta });
+
+  // -----------------------------------------------------------------------
+  // 24. findByParent (Feature 8)
+  // -----------------------------------------------------------------------
+  if (allSeries.length > 0) {
+    const parentId = allSeries[0].id;
+    const childSeasons = await client
+      .findByParent(seasonType, 'serie', parentId)
+      .page(1, 5, true)
+      .fields('id number year')
+      .exec();
+    log('24. findByParent(' + seasonType + ', "serie", "' + parentId + '")', childSeasons);
+  } else {
+    log('24. findByParent -- skipped (no series)', '');
+  }
+
+  // -----------------------------------------------------------------------
+  // 25. search (Feature 9)
+  // -----------------------------------------------------------------------
+  const searchResults = await client.search('star', 'a', {
+    displayField: 'name',
+    page: 1,
+    size: 5,
+  });
+  log('25. search("star", "a", { displayField: "name" })', searchResults);
+
+  // -----------------------------------------------------------------------
+  // 26. State machine metadata (Feature 10)
+  // -----------------------------------------------------------------------
+  log('26. State machine metadata', {
+    'getStateMachineFields(seasonType)': client.getStateMachineFields(seasonType),
+    'getAvailableTransitions(seasonType)': client.getAvailableTransitions(seasonType),
+  });
+
+  // -----------------------------------------------------------------------
+  // 27. execWithMeta -- pagination count (Feature 11)
+  // -----------------------------------------------------------------------
+  const { data: pagedSeries, extensions } = await client
+    .find(serieType)
+    .page(1, 2, true)
+    .execWithMeta();
+  log('27. execWithMeta -- pagination count', {
+    data: pagedSeries,
+    extensions,
+    totalCount: extensions?.count,
+  });
+
   console.log('\n' + '='.repeat(60));
   console.log('Demo complete.');
   console.log('='.repeat(60));

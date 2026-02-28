@@ -1,4 +1,10 @@
-import fetch from 'node-fetch';
+if (typeof globalThis.fetch !== 'function') {
+  throw new Error(
+    'SimfinityClient requires a global fetch implementation. ' +
+    'Use Node.js 18+ (which includes native fetch) or provide a fetch polyfill.'
+  );
+}
+const _fetch = globalThis.fetch.bind(globalThis);
 
 const INTROSPECTION_QUERY = `
   query IntrospectionQuery {
@@ -11,27 +17,46 @@ const INTROSPECTION_QUERY = `
         fields {
           name
           type {
-            name kind
+            kind name
             ofType {
-              name kind
+              kind name
               ofType {
-                name kind
-                ofType { name kind }
+                kind name
+                ofType {
+                  kind name
+                  ofType {
+                    kind name
+                  }
+                }
               }
             }
           }
           args {
             name
             type {
-              name kind
+              kind name
               ofType {
-                name kind
+                kind name
                 ofType {
-                  name kind
-                  ofType { name kind }
+                  kind name
+                  ofType {
+                    kind name
+                    ofType {
+                      kind name
+                    }
+                  }
                 }
               }
             }
+          }
+          extensions {
+            relation {
+              displayField
+              embedded
+              connectionField
+            }
+            stateMachine
+            readOnly
           }
         }
         enumValues { name }
@@ -50,6 +75,48 @@ function unwrapType(typeRef) {
     current = current.ofType;
   }
   return { name: current?.name, kind: current?.kind, isList, isNonNull };
+}
+
+function getActualScalarType(name) {
+  if (!name) return null;
+  return name.includes('_') ? name.split('_').pop() || name : name;
+}
+
+function isNumericScalar(name) {
+  if (!name) return false;
+  const actual = getActualScalarType(name);
+  if (!actual) return false;
+  const n = actual.toLowerCase();
+  return n === 'int' || n === 'float' || n === 'idnumber';
+}
+
+function isBooleanScalar(name) {
+  if (!name) return false;
+  const actual = getActualScalarType(name);
+  if (!actual) return false;
+  return actual.toLowerCase() === 'boolean';
+}
+
+function isDateTimeScalar(name) {
+  if (!name) return false;
+  const actual = getActualScalarType(name);
+  if (!actual) return false;
+  const n = actual.toLowerCase();
+  return n === 'date' || n === 'datetime' || n === 'timestamp'
+    || n === 'isodate' || n === 'graphqldate' || n === 'graphqldatetime';
+}
+
+function isScalarOrEnum(kind) {
+  return kind === 'SCALAR' || kind === 'ENUM';
+}
+
+function isListType(rawType) {
+  let current = rawType;
+  while (current) {
+    if (current.kind === 'LIST') return true;
+    current = current.ofType || null;
+  }
+  return false;
 }
 
 function typeRefToString(typeRef) {
@@ -73,6 +140,33 @@ class SelectionTree {
   addScalars(fieldNames) {
     for (const name of fieldNames.trim().split(/\s+/)) {
       if (name) this.scalars.add(name);
+    }
+  }
+
+  addSelection(selectionString) {
+    const tokens = selectionString.trim().split(/\s+/);
+    let i = 0;
+    while (i < tokens.length) {
+      const token = tokens[i];
+      if (token === '{' || token === '}') { i++; continue; }
+      if (i + 1 < tokens.length && tokens[i + 1] === '{') {
+        let depth = 1;
+        let j = i + 2;
+        while (j < tokens.length && depth > 0) {
+          if (tokens[j] === '{') depth++;
+          else if (tokens[j] === '}') depth--;
+          j++;
+        }
+        const inner = tokens.slice(i + 2, j - 1).join(' ');
+        if (!this.children.has(token)) {
+          this.children.set(token, new SelectionTree());
+        }
+        this.children.get(token).addSelection(inner);
+        i = j;
+      } else {
+        this.scalars.add(token);
+        i++;
+      }
     }
   }
 
@@ -156,7 +250,7 @@ class QueryBuilder {
   // -- Result Shaping ------------------------------------------------------
 
   fields(selectionString) {
-    this._selectionTree.addScalars(selectionString);
+    this._selectionTree.addSelection(selectionString);
     this._hasExplicitFields = true;
     return this;
   }
@@ -174,6 +268,14 @@ class QueryBuilder {
     return this;
   }
 
+  autoSelect() {
+    const result = this._client.buildSelectionSet(this._typeName);
+    this._hasExplicitFields = true;
+    this._autoSelection = result.selection;
+    this._selectionMeta = result;
+    return this;
+  }
+
   // -- Execution -----------------------------------------------------------
 
   async exec() {
@@ -187,7 +289,7 @@ class QueryBuilder {
       this._selectionTree.addScalars(autoFields);
     }
 
-    const selectionSet = this._selectionTree.serialize();
+    const selectionSet = this._autoSelection || this._selectionTree.serialize();
     if (!selectionSet) {
       throw new Error(`No fields to select for type '${this._typeName}'`);
     }
@@ -215,7 +317,59 @@ class QueryBuilder {
       error.graphQLErrors = response.errors;
       throw error;
     }
-    return response.data[queryInfo.name];
+
+    const result = response.data[queryInfo.name];
+
+    if (response.extensions) {
+      result.__extensions = response.extensions;
+    }
+
+    return result;
+  }
+
+  async execWithMeta() {
+    const queryInfo = this._client._findPluralQuery(this._typeName);
+    if (!queryInfo) {
+      throw new Error(`No plural query found for type '${this._typeName}'`);
+    }
+
+    if (!this._hasExplicitFields) {
+      const autoFields = this._client._getScalarFields(this._typeName);
+      this._selectionTree.addScalars(autoFields);
+    }
+
+    const selectionSet = this._autoSelection || this._selectionTree.serialize();
+    if (!selectionSet) {
+      throw new Error(`No fields to select for type '${this._typeName}'`);
+    }
+
+    const varDefs = [];
+    const variables = {};
+    const argMappings = [];
+
+    for (const [key, val] of Object.entries(this._variables)) {
+      const arg = queryInfo.args.find(a => a.name === key);
+      if (arg) {
+        varDefs.push(`$${key}: ${typeRefToString(arg.type)}`);
+        variables[key] = val;
+        argMappings.push(`${key}: $${key}`);
+      }
+    }
+
+    const varDefsStr = varDefs.length > 0 ? `(${varDefs.join(', ')})` : '';
+    const argsBlock = argMappings.length > 0 ? `(${argMappings.join(', ')})` : '';
+    const query = `query${varDefsStr} { ${queryInfo.name}${argsBlock} { ${selectionSet} } }`;
+
+    const response = await this._client._sendRequest(query, variables);
+    if (response.errors) {
+      const error = new Error(`GraphQL errors: ${JSON.stringify(response.errors)}`);
+      error.graphQLErrors = response.errors;
+      throw error;
+    }
+    return {
+      data: response.data[queryInfo.name],
+      extensions: response.extensions || null,
+    };
   }
 }
 
@@ -329,6 +483,7 @@ export default class SimfinityClient {
     this._typeNameToPlural = new Map();
     this._typeNameToSingular = new Map();
     this._typeNameToAggregate = new Map();
+    this._queryNameToType = new Map();
     this._initialized = false;
   }
 
@@ -366,6 +521,7 @@ export default class SimfinityClient {
           type: unwrapType(f.type),
           rawType: f.type,
           args: (f.args || []).map(a => ({ name: a.name, type: a.type })),
+          extensions: f.extensions || null,
         })),
         enumValues: (type.enumValues || []).map(v => v.name),
       };
@@ -400,6 +556,14 @@ export default class SimfinityClient {
       if (this._queries.has(aggName)) {
         this._typeNameToAggregate.set(typeName, aggName);
       }
+    }
+
+    this._queryNameToType = new Map();
+    for (const [typeName, queryName] of this._typeNameToPlural) {
+      this._queryNameToType.set(queryName, typeName);
+    }
+    for (const [typeName, queryName] of this._typeNameToSingular) {
+      this._queryNameToType.set(queryName, typeName);
     }
   }
 
@@ -494,7 +658,7 @@ export default class SimfinityClient {
     if (variables && Object.keys(variables).length > 0) {
       body.variables = variables;
     }
-    const response = await fetch(this._endpoint, {
+    const response = await _fetch(this._endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
@@ -512,6 +676,64 @@ export default class SimfinityClient {
   aggregate(typeName) {
     this._ensureInitialized();
     return new AggregateBuilder(this, typeName);
+  }
+
+  findByParent(typeName, connectionField, parentId) {
+    this._ensureInitialized();
+    const builder = new QueryBuilder(this, typeName);
+    builder.where(connectionField, [{ path: 'id', operator: 'EQ', value: parentId }]);
+    builder.sort('id', 'ASC');
+    return builder;
+  }
+
+  async search(typeName, searchTerm, options = {}) {
+    this._ensureInitialized();
+    const { page = 1, size = 10, displayField = null } = options;
+
+    let searchField = displayField;
+    if (!searchField) {
+      const typeInfo = this._types.get(typeName);
+      if (typeInfo?.fields) {
+        const nameField = typeInfo.fields.find(f => f.name === 'name');
+        if (nameField) {
+          searchField = 'name';
+        } else {
+          const firstScalar = typeInfo.fields.find(f =>
+            isScalarOrEnum(f.type.kind) && f.name !== 'id'
+          );
+          searchField = firstScalar?.name || 'id';
+        }
+      }
+    }
+
+    const typeInfo = this._types.get(typeName);
+    const fieldInfo = typeInfo?.fields.find(f => f.name === searchField);
+    const fieldTypeName = fieldInfo?.type?.name || 'String';
+
+    const isString = !isNumericScalar(fieldTypeName) && !isBooleanScalar(fieldTypeName);
+    const operator = isString ? 'LIKE' : 'EQ';
+
+    let castedTerm = searchTerm;
+    if (isNumericScalar(fieldTypeName)) {
+      const actualType = getActualScalarType(fieldTypeName);
+      if (actualType?.toLowerCase() === 'int') {
+        const parsed = parseInt(searchTerm, 10);
+        if (!isNaN(parsed)) castedTerm = parsed;
+      } else {
+        const parsed = parseFloat(searchTerm);
+        if (!isNaN(parsed)) castedTerm = parsed;
+      }
+    } else if (isBooleanScalar(fieldTypeName)) {
+      if (searchTerm.toLowerCase() === 'true') castedTerm = true;
+      else if (searchTerm.toLowerCase() === 'false') castedTerm = false;
+    }
+
+    const builder = this.find(typeName)
+      .fields(`id ${searchField}`)
+      .page(page, size, false)
+      .where(searchField, operator, castedTerm);
+
+    return builder.exec();
   }
 
   async getById(typeName, id, fields) {
@@ -538,14 +760,24 @@ export default class SimfinityClient {
 
   // -- CRUD Mutation Methods -----------------------------------------------
 
-  async add(typeName, input, fields) {
+  async add(typeName, input, fields, options = {}) {
     this._ensureInitialized();
-    return this._executeMutation(`add${typeName}`, typeName, { input }, fields);
+    const transformedInput = options.transform
+      ? this.transformInput(typeName, input, { mode: 'create', ...options })
+      : input;
+    return this._executeMutation(`add${typeName}`, typeName, { input: transformedInput }, fields);
   }
 
-  async update(typeName, id, input, fields) {
+  async update(typeName, id, input, fields, options = {}) {
     this._ensureInitialized();
-    return this._executeMutation(`update${typeName}`, typeName, { input: { id, ...input } }, fields);
+    const transformedInput = options.transform
+      ? this.transformInput(typeName, input, { mode: 'update', ...options })
+      : input;
+    return this._executeMutation(
+      `update${typeName}`, typeName,
+      { input: { id, ...transformedInput } },
+      fields,
+    );
   }
 
   async delete(typeName, id, fields) {
@@ -583,6 +815,29 @@ export default class SimfinityClient {
       }
     }
     return null;
+  }
+
+  getStateMachineFields(typeName) {
+    this._ensureInitialized();
+    const typeInfo = this._types.get(typeName);
+    if (!typeInfo?.fields) return [];
+    return typeInfo.fields
+      .filter(f => f.extensions?.stateMachine === true)
+      .map(f => f.name);
+  }
+
+  getAvailableTransitions(typeName) {
+    this._ensureInitialized();
+    const transitions = [];
+    for (const info of this._mutations.values()) {
+      if (info.category === 'stateTransition' && info.typeName === typeName) {
+        transitions.push({
+          action: info.action,
+          mutationName: info.name,
+        });
+      }
+    }
+    return transitions;
   }
 
   // -- Custom Mutations ----------------------------------------------------
@@ -653,6 +908,409 @@ export default class SimfinityClient {
 
   getMutations() {
     return Object.fromEntries(this._mutations);
+  }
+
+  // -- Selection Set Building ------------------------------------------------
+
+  buildSelectionSet(typeName) {
+    this._ensureInitialized();
+    const typeInfo = this._types.get(typeName);
+    if (!typeInfo?.fields) {
+      return { selection: 'id', columns: ['id'], sortFieldByColumn: {}, fieldTypeByColumn: {} };
+    }
+
+    const columns = [];
+    const sortFieldByColumn = {};
+    const fieldTypeByColumn = {};
+    const fieldSelections = [];
+
+    for (const field of typeInfo.fields) {
+      const { name, type: unwrapped, rawType, extensions } = field;
+
+      if (isListType(rawType)) continue;
+
+      if (isScalarOrEnum(unwrapped.kind)) {
+        fieldSelections.push(name);
+        if (name !== 'id') columns.push(name);
+        sortFieldByColumn[name] = name;
+        fieldTypeByColumn[name] = unwrapped.name || unwrapped.kind || 'SCALAR';
+      } else if (unwrapped.kind === 'OBJECT' && unwrapped.name) {
+        const objType = this._types.get(unwrapped.name);
+        const objFields = objType?.fields || [];
+        const objFieldNames = new Set(objFields.map(f => f.name));
+        const isEmbedded = extensions?.relation?.embedded === true;
+
+        let chosenDisplay = null;
+        const extDisplay = extensions?.relation?.displayField;
+        if (extDisplay && objFieldNames.has(extDisplay)) {
+          chosenDisplay = extDisplay;
+        } else if (objFieldNames.has('name')) {
+          chosenDisplay = 'name';
+        } else {
+          const firstScalar = objFields.find(f =>
+            isScalarOrEnum(f.type.kind) && !f.type.isList
+          );
+          chosenDisplay = firstScalar?.name || null;
+        }
+
+        const subFields = new Set();
+        if (chosenDisplay) subFields.add(chosenDisplay);
+        if (!isEmbedded && objFieldNames.has('id')) subFields.add('id');
+        if (subFields.size === 0) {
+          if (objFieldNames.has('id') && !isEmbedded) subFields.add('id');
+          else if (objFieldNames.has('name')) subFields.add('name');
+          else if (objFields[0]) subFields.add(objFields[0].name);
+        }
+
+        const subSelection = [...subFields].join(' ');
+        fieldSelections.push(`${name} { ${subSelection} }`);
+        columns.push(name);
+
+        if (chosenDisplay) {
+          sortFieldByColumn[name] = `${name}.${chosenDisplay}`;
+          const displayFieldInfo = objFields.find(f => f.name === chosenDisplay);
+          fieldTypeByColumn[name] = displayFieldInfo?.type?.name || 'OBJECT';
+        } else {
+          sortFieldByColumn[name] = name;
+          fieldTypeByColumn[name] = 'OBJECT';
+        }
+      }
+    }
+
+    const hasId = typeInfo.fields.some(f => f.name === 'id');
+    if (hasId && !fieldSelections.includes('id')) {
+      fieldSelections.unshift('id');
+    }
+
+    return {
+      selection: fieldSelections.join('\n'),
+      columns,
+      sortFieldByColumn,
+      fieldTypeByColumn,
+    };
+  }
+
+  // -- Schema Metadata Access -----------------------------------------------
+
+  getFieldExtensions(typeName, fieldName) {
+    this._ensureInitialized();
+    const typeInfo = this._types.get(typeName);
+    if (!typeInfo) return null;
+    const field = typeInfo.fields.find(f => f.name === fieldName);
+    return field?.extensions || null;
+  }
+
+  getDisplayField(typeName, fieldName) {
+    this._ensureInitialized();
+    const ext = this.getFieldExtensions(typeName, fieldName);
+    const displayField = ext?.relation?.displayField;
+    if (displayField) return displayField;
+
+    const typeInfo = this._types.get(typeName);
+    const field = typeInfo?.fields.find(f => f.name === fieldName);
+    if (!field || field.type.kind !== 'OBJECT') return null;
+
+    const objectType = this._types.get(field.type.name);
+    if (!objectType?.fields) return null;
+
+    const objFieldNames = objectType.fields.map(f => f.name);
+    if (objFieldNames.includes('name')) return 'name';
+
+    const firstScalar = objectType.fields.find(f =>
+      isScalarOrEnum(f.type.kind) && !f.type.isList
+    );
+    return firstScalar?.name || null;
+  }
+
+  isEmbeddedField(typeName, fieldName) {
+    this._ensureInitialized();
+    const ext = this.getFieldExtensions(typeName, fieldName);
+    return ext?.relation?.embedded === true;
+  }
+
+  getConnectionField(typeName, fieldName) {
+    this._ensureInitialized();
+    const ext = this.getFieldExtensions(typeName, fieldName);
+    return ext?.relation?.connectionField || null;
+  }
+
+  isStateMachineField(typeName, fieldName) {
+    this._ensureInitialized();
+    const ext = this.getFieldExtensions(typeName, fieldName);
+    return ext?.stateMachine === true;
+  }
+
+  isReadOnlyField(typeName, fieldName) {
+    this._ensureInitialized();
+    const ext = this.getFieldExtensions(typeName, fieldName);
+    return ext?.readOnly === true;
+  }
+
+  getEnumValues(typeName) {
+    this._ensureInitialized();
+    const typeInfo = this._types.get(typeName);
+    if (!typeInfo || typeInfo.kind !== 'ENUM') return [];
+    return typeInfo.enumValues || [];
+  }
+
+  getFieldsOfType(typeName) {
+    this._ensureInitialized();
+    const typeInfo = this._types.get(typeName);
+    if (!typeInfo) return [];
+    return typeInfo.fields;
+  }
+
+  getDescriptionFieldType(typeName, descriptionField) {
+    this._ensureInitialized();
+    const typeInfo = this._types.get(typeName);
+    if (!typeInfo?.fields) return 'String';
+    const field = typeInfo.fields.find(f => f.name === descriptionField);
+    if (!field) return 'String';
+    return field.type.name || 'String';
+  }
+
+  // -- Entity & Query Name Resolution ----------------------------------------
+
+  getTypeNameForQuery(queryName) {
+    this._ensureInitialized();
+    const queryInfo = this._queries.get(queryName);
+    return queryInfo?.returnType?.name || null;
+  }
+
+  getPluralQueryName(typeName) {
+    this._ensureInitialized();
+    return this._typeNameToPlural.get(typeName) || null;
+  }
+
+  getSingularQueryName(typeName) {
+    this._ensureInitialized();
+    return this._typeNameToSingular.get(typeName) || null;
+  }
+
+  getListEntityNames() {
+    this._ensureInitialized();
+    const names = [];
+    for (const [queryName, queryInfo] of this._queries) {
+      if (queryInfo.returnType.isList && !queryName.endsWith('_aggregate')) {
+        names.push(queryName);
+      }
+    }
+    return names.sort();
+  }
+
+  getListEntityNamesOfType(typeName) {
+    this._ensureInitialized();
+    const names = [];
+    for (const [queryName, queryInfo] of this._queries) {
+      if (queryInfo.returnType.isList
+        && queryInfo.returnType.name === typeName
+        && !queryName.endsWith('_aggregate')) {
+        names.push(queryName);
+      }
+    }
+    return names.sort();
+  }
+
+  getQueryNamesForType(typeName) {
+    this._ensureInitialized();
+    return {
+      pluralQueryName: this._typeNameToPlural.get(typeName) || null,
+      singularQueryName: this._typeNameToSingular.get(typeName) || null,
+      aggregateQueryName: this._typeNameToAggregate.get(typeName) || null,
+    };
+  }
+
+  // -- Scalar Type Utilities -----------------------------------------------
+
+  getActualScalarType(scalarName) { return getActualScalarType(scalarName); }
+  isNumericScalar(scalarName) { return isNumericScalar(scalarName); }
+  isBooleanScalar(scalarName) { return isBooleanScalar(scalarName); }
+  isDateTimeScalar(scalarName) { return isDateTimeScalar(scalarName); }
+
+  // -- Mutation Input Transformation -----------------------------------------
+
+  transformInput(typeName, rawInput, options = {}) {
+    this._ensureInitialized();
+    const { skipFields = [], transientFields = [], mode = 'create' } = options;
+    const typeInfo = this._types.get(typeName);
+    if (!typeInfo) return { ...rawInput };
+
+    const transformed = {};
+
+    for (const field of typeInfo.fields) {
+      const { name, type: unwrapped, rawType, extensions } = field;
+
+      if (rawInput[name] === undefined) continue;
+      if (name === 'id') continue;
+      if (skipFields.includes(name) || transientFields.includes(name)) continue;
+      if (extensions?.stateMachine === true) continue;
+      if (extensions?.readOnly === true) continue;
+      if (isListType(rawType) && unwrapped.kind === 'OBJECT') continue;
+
+      let value = rawInput[name];
+
+      if (unwrapped.kind === 'OBJECT' && extensions?.relation?.embedded === true) {
+        value = this._transformEmbeddedInput(unwrapped.name, value, options);
+      } else if (unwrapped.kind === 'OBJECT' && !extensions?.relation?.embedded) {
+        value = this._cleanObjectFieldForMutation(value);
+      } else {
+        value = this._coerceScalarValue(value, unwrapped.name);
+      }
+
+      if (value !== undefined && value !== null && value !== '') {
+        transformed[name] = value;
+      }
+    }
+
+    return this._deepRemoveTypename(transformed);
+  }
+
+  _transformEmbeddedInput(objectTypeName, value, options = {}) {
+    if (!value || typeof value !== 'object') return value;
+    const typeInfo = this._types.get(objectTypeName);
+    if (!typeInfo?.fields) return value;
+
+    const cleaned = {};
+    for (const field of typeInfo.fields) {
+      const { name, type: unwrapped, extensions } = field;
+      if (value[name] === undefined) continue;
+      if (extensions?.readOnly === true) continue;
+
+      let fieldValue = value[name];
+      fieldValue = this._coerceScalarValue(fieldValue, unwrapped.name);
+
+      if (fieldValue !== undefined && fieldValue !== null && fieldValue !== '') {
+        cleaned[name] = fieldValue;
+      }
+    }
+    return Object.keys(cleaned).length > 0 ? cleaned : undefined;
+  }
+
+  _cleanObjectFieldForMutation(value) {
+    if (!value) return value;
+    if (typeof value === 'string') return { id: value };
+    if (typeof value === 'object' && value.id) return { id: value.id };
+    return value;
+  }
+
+  _coerceScalarValue(value, scalarTypeName) {
+    if (value === null || value === undefined) return value;
+
+    if (isNumericScalar(scalarTypeName) && typeof value === 'string') {
+      return Number(value);
+    }
+
+    if (isDateTimeScalar(scalarTypeName) && typeof value === 'string') {
+      if (/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+        return `${value}T00:00:00.000Z`;
+      }
+    }
+
+    return value;
+  }
+
+  _deepRemoveTypename(obj) {
+    if (typeof obj !== 'object' || obj === null) return obj;
+    if (Array.isArray(obj)) return obj.map(item => this._deepRemoveTypename(item));
+
+    const cleaned = {};
+    for (const [key, value] of Object.entries(obj)) {
+      if (key === '__typename') continue;
+      cleaned[key] = this._deepRemoveTypename(value);
+    }
+    return cleaned;
+  }
+
+  // -- Collection Delta Mutations --------------------------------------------
+
+  transformCollectionDelta(collectionTypeName, delta, options = {}) {
+    this._ensureInitialized();
+    const { connectionField = null } = options;
+    const result = {};
+
+    if (delta.added && delta.added.length > 0) {
+      result.added = delta.added.map(item => {
+        let clean = { ...item };
+
+        delete clean.__status;
+        delete clean.__originalData;
+
+        if (connectionField && clean[connectionField] !== undefined) {
+          delete clean[connectionField];
+        }
+
+        if (clean.id && typeof clean.id === 'string' && clean.id.startsWith('temp_')) {
+          delete clean.id;
+        }
+
+        clean = this._cleanCollectionItem(collectionTypeName, clean);
+        clean = this._deepRemoveTypename(clean);
+        return clean;
+      });
+    }
+
+    if (delta.updated && delta.updated.length > 0) {
+      result.updated = delta.updated.map(item => {
+        let clean = { ...item };
+
+        delete clean.__status;
+        delete clean.__originalData;
+
+        if (connectionField && clean[connectionField] !== undefined) {
+          delete clean[connectionField];
+        }
+
+        clean = this._cleanCollectionItem(collectionTypeName, clean);
+        clean = this._deepRemoveTypename(clean);
+        return clean;
+      });
+    }
+
+    if (delta.deleted && delta.deleted.length > 0) {
+      result.deleted = delta.deleted.map(item => {
+        if (typeof item === 'string') return item;
+        if (typeof item === 'object' && item.id) return item.id;
+        return item;
+      });
+    }
+
+    return result;
+  }
+
+  _cleanCollectionItem(collectionTypeName, item) {
+    const typeInfo = this._types.get(collectionTypeName);
+    if (!typeInfo?.fields) return item;
+
+    const cleaned = { ...item };
+
+    for (const field of typeInfo.fields) {
+      const { name, type: unwrapped, rawType, extensions } = field;
+      if (cleaned[name] === undefined) continue;
+
+      if (extensions?.stateMachine === true) {
+        delete cleaned[name];
+        continue;
+      }
+
+      if (unwrapped.kind === 'OBJECT' && !extensions?.relation?.embedded) {
+        const val = cleaned[name];
+        if (val && typeof val === 'object' && 'id' in val) {
+          cleaned[name] = { id: val.id };
+        }
+        continue;
+      }
+
+      if (isNumericScalar(unwrapped.name) && typeof cleaned[name] === 'string') {
+        cleaned[name] = Number(cleaned[name]);
+      }
+      if (isDateTimeScalar(unwrapped.name) && typeof cleaned[name] === 'string') {
+        if (/^\d{4}-\d{2}-\d{2}$/.test(cleaned[name])) {
+          cleaned[name] = `${cleaned[name]}T00:00:00.000Z`;
+        }
+      }
+    }
+
+    return cleaned;
   }
 
   // -- Guard ---------------------------------------------------------------

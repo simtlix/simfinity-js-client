@@ -1,6 +1,6 @@
 # @simtlix/simfinity-js-client
 
-Introspection-driven GraphQL client for [simfinity-js](https://github.com/simtlix/simfinity.js) APIs. It discovers your schema at runtime via introspection and exposes a chainable query builder, CRUD helpers, aggregate queries, and state-machine transitions — no code generation required.
+Introspection-driven GraphQL client for [simfinity-js](https://github.com/simtlix/simfinity.js) APIs. It discovers your schema at runtime via introspection and exposes a chainable query builder, CRUD helpers, aggregate queries, state-machine transitions, schema metadata access, mutation input transformation, and more — no code generation required.
 
 ## Installation
 
@@ -28,7 +28,7 @@ Creates a new client instance pointing at the given GraphQL endpoint.
 
 ### `client.init()`
 
-Runs an introspection query against the endpoint and builds internal registries of types, queries, and mutations. **Must be called before any other method.**
+Runs an introspection query against the endpoint and builds internal registries of types, queries, and mutations — including Simfinity-specific field extensions (relation metadata, state machine flags, read-only markers). **Must be called before any other method.**
 
 ### Schema Inspection
 
@@ -58,7 +58,7 @@ const results = await client.find('serie')
 
 #### `.where(field, operator, value [, value2])`
 
-Filter by a scalar field. Supported operators depend on the server schema (e.g. `EQ`, `NE`, `GT`, `LT`, `GTE`, `LTE`, `BETWEEN`, `LIKE`).
+Filter by a scalar field. Supported operators depend on the server schema (e.g. `EQ`, `NE`, `GT`, `LT`, `GTE`, `LTE`, `BETWEEN`, `LIKE`, `NIN`).
 
 #### `.where(field, terms)`
 
@@ -82,13 +82,41 @@ Include a related collection's fields. Supports dot-notation for nested joins (e
 
 Space-separated list of scalar fields to select on the root type. If omitted, all scalar and enum fields are selected automatically.
 
+#### `.autoSelect()`
+
+Automatically builds a full selection set using schema metadata, including nested object fields with display field resolution. Returns the builder for chaining. The selection metadata is available via `builder._selectionMeta`.
+
+```js
+const results = await client.find('serie')
+  .autoSelect()
+  .page(1, 10)
+  .exec();
+```
+
 #### `.page(page, size [, count])`
 
-Paginate results. `page` is 1-based.
+Paginate results. `page` is 1-based. Set `count` to `true` to include total count in response extensions.
 
 #### `.sort(field, order)`
 
 Sort results. `order` is `'ASC'` or `'DESC'`. Can be called multiple times for multi-field sorting.
+
+#### `.exec()`
+
+Executes the query and returns the result array. If the server returns extensions (e.g. pagination count), they are attached as `result.__extensions`.
+
+#### `.execWithMeta()`
+
+Executes the query and returns a `{ data, extensions }` wrapper for clean access to response metadata:
+
+```js
+const { data: series, extensions } = await client.find('serie')
+  .page(1, 10, true)
+  .execWithMeta();
+
+console.log(series);              // the result array
+console.log(extensions?.count);   // total count from server
+```
 
 ---
 
@@ -130,6 +158,44 @@ If `fields` is omitted, all scalar fields are returned.
 
 ---
 
+### Collection Item Queries — `client.findByParent()`
+
+Query collection items filtered by their parent entity:
+
+```js
+const seasons = await client.findByParent('season', 'serie', parentSerieId)
+  .page(1, 10, true)
+  .fields('id number year state')
+  .exec();
+```
+
+Returns a `QueryBuilder` pre-configured with a connection field filter and default sort by `id ASC`. Chain additional `.where()`, `.page()`, `.fields()`, `.sort()` as needed.
+
+---
+
+### FK/Relation Search — `client.search()`
+
+Search-as-you-type for FK reference fields:
+
+```js
+const results = await client.search('Genre', 'com', {
+  displayField: 'name',
+  page: 1,
+  size: 10,
+});
+// [{ id: '1', name: 'Comedy' }, { id: '2', name: 'Romantic Comedy' }]
+```
+
+Automatically selects the appropriate operator (`LIKE` for strings, `EQ` for numeric/boolean) and casts the search term to the field's scalar type.
+
+| Option | Default | Description |
+|---|---|---|
+| `displayField` | auto-resolved (`name` or first scalar) | Field to search by |
+| `page` | `1` | Page number |
+| `size` | `10` | Page size |
+
+---
+
 ### CRUD Mutations
 
 ```js
@@ -139,6 +205,56 @@ const updated = await client.update('star', createdId, { name: 'Jane Doe' }, 'id
 
 const deleted = await client.delete('star', createdId, 'id name');
 ```
+
+#### Automatic Input Transformation
+
+Pass `{ transform: true }` as the last argument to have the client automatically clean mutation input based on schema metadata — stripping `__typename`, coercing scalar types, extracting FK IDs, handling embedded objects, and skipping read-only/state-machine fields:
+
+```js
+const created = await client.add('serie', rawFormData, 'id name', { transform: true });
+
+const updated = await client.update('serie', id, rawFormData, 'id name', {
+  transform: true,
+  skipFields: ['temporaryField'],
+});
+```
+
+---
+
+### Mutation Input Transformation — `client.transformInput()`
+
+Schema-aware mutation input cleaning, usable standalone:
+
+```js
+const cleaned = client.transformInput('serie', rawInput, {
+  mode: 'create',           // or 'update'
+  skipFields: [],            // fields to exclude
+  transientFields: [],       // transient fields to exclude
+});
+```
+
+Handles: `__typename` removal, numeric/date coercion, embedded object cleaning, FK reference extraction (`{ id }` only), and skipping read-only, state-machine, and collection fields.
+
+---
+
+### Collection Delta Mutations — `client.transformCollectionDelta()`
+
+Build the `{ added, updated, deleted }` structure for collection field mutations:
+
+```js
+const delta = {
+  added: [{ id: 'temp_1', number: '3', year: '2025', __status: 'added' }],
+  updated: [{ id: 'real-id', number: '2', year: '2024', __status: 'modified' }],
+  deleted: [{ id: 'del-id' }],
+};
+
+const cleaned = client.transformCollectionDelta('season', delta, {
+  connectionField: 'serie',
+});
+// { added: [{ number: 3, year: 2025 }], updated: [{ id: 'real-id', number: 2, year: 2024 }], deleted: ['del-id'] }
+```
+
+Strips metadata (`__status`, `__originalData`, `__typename`), removes temporary IDs and connection fields, coerces scalar types, and extracts FK object IDs.
 
 ---
 
@@ -175,9 +291,83 @@ console.log(response.data);
 
 ---
 
+### Selection Set Building — `client.buildSelectionSet()`
+
+Generate a complete GraphQL selection set string with metadata from the schema, useful for building dynamic UIs:
+
+```js
+const { selection, columns, sortFieldByColumn, fieldTypeByColumn } =
+  client.buildSelectionSet('serie');
+```
+
+Returns:
+
+| Property | Type | Description |
+|---|---|---|
+| `selection` | `string` | GraphQL selection set string (includes nested object sub-selections) |
+| `columns` | `string[]` | Display column names (excludes `id`) |
+| `sortFieldByColumn` | `object` | Maps column name to sort field path (e.g. `director` -> `director.name`) |
+| `fieldTypeByColumn` | `object` | Maps column name to scalar type name |
+
+---
+
+### Schema Metadata Access
+
+#### Field Extensions
+
+```js
+const ext = client.getFieldExtensions('serie', 'director');
+// { relation: { displayField: 'name', embedded: true, connectionField: null }, stateMachine: null, readOnly: null }
+```
+
+| Method | Signature | Description |
+|---|---|---|
+| `getFieldExtensions` | `(typeName, fieldName)` | Full extensions object for a field |
+| `getDisplayField` | `(typeName, fieldName)` | Display field with fallback chain (extension -> `name` -> first scalar) |
+| `isEmbeddedField` | `(typeName, fieldName)` | Whether the field is an embedded object |
+| `getConnectionField` | `(typeName, fieldName)` | Back-reference field name for collections |
+| `isStateMachineField` | `(typeName, fieldName)` | Whether the field is state-machine managed |
+| `isReadOnlyField` | `(typeName, fieldName)` | Whether the field is read-only |
+| `getEnumValues` | `(typeName)` | Enum values for an enum type |
+| `getFieldsOfType` | `(typeName)` | All fields with full metadata |
+| `getDescriptionFieldType` | `(typeName, fieldName)` | Scalar type name of a display field |
+
+#### Entity & Query Name Resolution
+
+```js
+client.getTypeNameForQuery('series');           // 'serie'
+client.getPluralQueryName('serie');              // 'series'
+client.getSingularQueryName('serie');            // 'serie'
+client.getListEntityNames();                    // ['episodes', 'seasons', 'series', 'stars', ...]
+client.getListEntityNamesOfType('serie');        // ['series']
+client.getQueryNamesForType('serie');
+// { pluralQueryName: 'series', singularQueryName: 'serie', aggregateQueryName: 'series_aggregate' }
+```
+
+#### Scalar Type Utilities
+
+Simfinity uses validated scalar names like `SeasonNumber_Int` where the suffix after `_` indicates the base type:
+
+```js
+client.getActualScalarType('SeasonNumber_Int');  // 'Int'
+client.isNumericScalar('SeasonNumber_Int');       // true
+client.isBooleanScalar('Boolean');               // true
+client.isDateTimeScalar('StartDate_DateTime');   // true
+```
+
+#### State Machine Metadata
+
+```js
+client.getStateMachineFields('season');          // ['state']
+client.getAvailableTransitions('season');
+// [{ action: 'activate', mutationName: 'activate_season' }, { action: 'finalize', mutationName: 'finalize_season' }]
+```
+
+---
+
 ## Examples
 
-See [`examples/demo.js`](examples/demo.js) for a comprehensive walkthrough covering all features: schema discovery, filtering, joins, pagination, sorting, CRUD, state machine transitions, aggregates, and raw queries.
+See [`examples/demo.js`](examples/demo.js) for a comprehensive walkthrough covering all features: schema discovery, filtering, joins, pagination, sorting, CRUD, state machine transitions, aggregates, raw queries, schema metadata, selection set building, entity resolution, input transformation, collection deltas, parent queries, FK search, and response extensions.
 
 ```bash
 GRAPHQL_ENDPOINT=http://localhost:3000/graphql npm run demo
