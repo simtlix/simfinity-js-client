@@ -268,6 +268,12 @@ class QueryBuilder {
     return this;
   }
 
+  clearSort() {
+    this._sortTerms = [];
+    delete this._variables.sort;
+    return this;
+  }
+
   autoSelect() {
     const result = this._client.buildSelectionSet(this._typeName);
     this._hasExplicitFields = true;
@@ -312,7 +318,7 @@ class QueryBuilder {
     const query = `query${varDefsStr} { ${queryInfo.name}${argsBlock} { ${selectionSet} } }`;
 
     const response = await this._client._sendRequest(query, variables);
-    if (response.errors) {
+    if (response.errors && !response.data?.[queryInfo.name]) {
       const error = new Error(`GraphQL errors: ${JSON.stringify(response.errors)}`);
       error.graphQLErrors = response.errors;
       throw error;
@@ -361,7 +367,7 @@ class QueryBuilder {
     const query = `query${varDefsStr} { ${queryInfo.name}${argsBlock} { ${selectionSet} } }`;
 
     const response = await this._client._sendRequest(query, variables);
-    if (response.errors) {
+    if (response.errors && !response.data?.[queryInfo.name]) {
       const error = new Error(`GraphQL errors: ${JSON.stringify(response.errors)}`);
       error.graphQLErrors = response.errors;
       throw error;
@@ -750,7 +756,7 @@ export default class SimfinityClient {
     const query = `query($id: ${idType}) { ${queryInfo.name}(id: $id) { ${selectionSet} } }`;
     const response = await this._sendRequest(query, { id });
 
-    if (response.errors) {
+    if (response.errors && !response.data?.[queryInfo.name]) {
       const error = new Error(`GraphQL errors: ${JSON.stringify(response.errors)}`);
       error.graphQLErrors = response.errors;
       throw error;
