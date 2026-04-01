@@ -16,15 +16,28 @@ import SimfinityClient from '@simtlix/simfinity-js-client';
 const client = new SimfinityClient('http://localhost:3000/graphql');
 await client.init();
 
+// Optional: attach auth headers (perform login in your app; this client does not include login)
+const tokenStore = { accessToken: null };
+const authedClient = new SimfinityClient('http://localhost:3000/graphql', {
+  prepareHeaders(headers) {
+    if (tokenStore.accessToken) {
+      headers['Authorization'] = `Bearer ${tokenStore.accessToken}`;
+    }
+  },
+});
+await authedClient.init();
+
 const series = await client.find('serie').exec();
 console.log(series);
 ```
 
 ## API Reference
 
-### `new SimfinityClient(endpoint)`
+### `new SimfinityClient(endpoint [, options])`
 
 Creates a new client instance pointing at the given GraphQL endpoint.
+
+- **`options.prepareHeaders(headers)`** (optional): invoked before every GraphQL HTTP request. Mutate the plain `headers` object to add credentials (for example `Authorization`). The client does not implement login — call your auth API separately, then set tokens in a closure or store that `prepareHeaders` reads.
 
 ### `client.init()`
 

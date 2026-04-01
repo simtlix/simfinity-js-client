@@ -481,7 +481,14 @@ class AggregateBuilder {
 // ---------------------------------------------------------------------------
 
 export default class SimfinityClient {
-  constructor(endpoint) {
+  /**
+   * @param {string} endpoint GraphQL HTTP endpoint URL
+   * @param {{ prepareHeaders?: (headers: Record<string, string>) => void }} [options]
+   *        Optional `prepareHeaders` runs before each request; mutate `headers` to add auth
+   *        (e.g. `headers['Authorization'] = 'Bearer …'`). Login is not part of this client —
+   *        perform auth in your app and set tokens inside this callback or a closure it sees.
+   */
+  constructor(endpoint, options = {}) {
     this._endpoint = endpoint;
     this._types = new Map();
     this._queries = new Map();
@@ -491,6 +498,8 @@ export default class SimfinityClient {
     this._typeNameToAggregate = new Map();
     this._queryNameToType = new Map();
     this._initialized = false;
+    this._prepareHeaders =
+      typeof options.prepareHeaders === 'function' ? options.prepareHeaders : null;
   }
 
   // -- Initialization ------------------------------------------------------
@@ -664,9 +673,13 @@ export default class SimfinityClient {
     if (variables && Object.keys(variables).length > 0) {
       body.variables = variables;
     }
+    const headers = { 'Content-Type': 'application/json' };
+    if (this._prepareHeaders) {
+      this._prepareHeaders(headers);
+    }
     const response = await _fetch(this._endpoint, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify(body),
     });
     return response.json();
