@@ -83,6 +83,106 @@ Filter by a collection field using an array of term objects:
 ])
 ```
 
+#### `.or(groups)` / `.and(groups)`
+
+Add AND/OR logical filter groups for complex boolean conditions. Each method accepts an array of `QLFilterGroup` objects and can be called multiple times (groups accumulate). These combine with existing flat `.where()` filters via AND at the top level.
+
+A `QLFilterGroup` is a plain object with optional `AND`, `OR`, and `conditions` fields:
+
+```js
+{
+  conditions: [{ field: 'category', operator: 'EQ', value: 'Drama' }],
+  AND: [/* nested QLFilterGroup objects */],
+  OR:  [/* nested QLFilterGroup objects */],
+}
+```
+
+**Simple OR** -- return series in either Drama or Comedy:
+
+```js
+const results = await client.find('serie')
+  .or([
+    SimfinityClient.condition('categories', 'EQ', 'Drama'),
+    SimfinityClient.condition('categories', 'EQ', 'Comedy'),
+  ])
+  .fields('id name categories')
+  .exec();
+```
+
+**Flat filters combined with OR** -- flat `.where()` is ANDed with the OR group:
+
+```js
+const results = await client.find('serie')
+  .where('categories', 'NE', 'Horror')
+  .or([
+    SimfinityClient.condition('name', 'LIKE', 'Breaking'),
+    SimfinityClient.condition('name', 'LIKE', 'Game'),
+  ])
+  .fields('id name categories')
+  .exec();
+// Equivalent to: categories != "Horror" AND (name LIKE "Breaking" OR name LIKE "Game")
+```
+
+**Nested AND inside OR**:
+
+```js
+const results = await client.find('serie')
+  .or([
+    { AND: [
+      SimfinityClient.condition('categories', 'EQ', 'Drama'),
+      SimfinityClient.condition('year', 'GTE', 2020),
+    ]},
+    { AND: [
+      SimfinityClient.condition('categories', 'EQ', 'Comedy'),
+      SimfinityClient.condition('year', 'GTE', 2015),
+    ]},
+  ])
+  .exec();
+// Equivalent to: (categories = "Drama" AND year >= 2020) OR (categories = "Comedy" AND year >= 2015)
+```
+
+**AND with nested OR groups**:
+
+```js
+const results = await client.find('serie')
+  .where('year', 'GTE', 2000)
+  .and([
+    { OR: [
+      SimfinityClient.condition('categories', 'EQ', 'Drama'),
+      SimfinityClient.condition('categories', 'EQ', 'Comedy'),
+    ]},
+    { OR: [
+      SimfinityClient.condition('director', 'EQ', 'UK', 'country'),
+      SimfinityClient.condition('director', 'EQ', 'US', 'country'),
+    ]},
+  ])
+  .exec();
+// Equivalent to: year >= 2000 AND (Drama OR Comedy) AND (UK OR US director)
+```
+
+**Relationship path filtering** -- use the `path` parameter for object field conditions:
+
+```js
+.or([
+  SimfinityClient.condition('director', 'LIKE', 'Adams', 'name'),
+  SimfinityClient.condition('director', 'LIKE', 'Nolan', 'name'),
+])
+```
+
+The Aggregate Builder also supports `.or()` and `.and()` with identical behavior. The server enforces a maximum nesting depth of 5 levels.
+
+#### `SimfinityClient.condition(field, operator, value [, path])`
+
+Static convenience factory for creating a filter group with a single condition. Returns a `QLFilterGroup` object:
+
+```js
+SimfinityClient.condition('category', 'EQ', 'Drama')
+// Equivalent to: { conditions: [{ field: 'category', operator: 'EQ', value: 'Drama' }] }
+
+SimfinityClient.condition('author', 'LIKE', 'Adams', 'name')
+// Equivalent to: { conditions: [{ field: 'author', operator: 'LIKE', value: 'Adams', path: 'name' }] }
+```
+
 #### `.joinObject(path, fields)`
 
 Include a related object's fields in the selection.

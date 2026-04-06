@@ -344,6 +344,58 @@ const log = (label, data) => {
     totalCount: extensions?.count,
   });
 
+  // -----------------------------------------------------------------------
+  // 28. find() with OR filter
+  // -----------------------------------------------------------------------
+  const orResults = await client.find(serieType)
+    .or([
+      SimfinityClient.condition('categories', 'EQ', 'Drama'),
+      SimfinityClient.condition('categories', 'EQ', 'Comedy'),
+    ])
+    .fields('id name categories')
+    .exec();
+  log('28. find() -- OR filter (Drama OR Comedy)', orResults);
+
+  // -----------------------------------------------------------------------
+  // 29. find() with flat where + OR combined
+  // -----------------------------------------------------------------------
+  const combinedOrResults = await client.find(serieType)
+    .where('categories', 'NE', 'Horror')
+    .or([
+      SimfinityClient.condition('name', 'LIKE', 'Breaking'),
+      SimfinityClient.condition('name', 'LIKE', 'Game'),
+    ])
+    .fields('id name categories')
+    .exec();
+  log('29. find() -- flat where + OR (not Horror AND (name LIKE Breaking OR Game))', combinedOrResults);
+
+  // -----------------------------------------------------------------------
+  // 30. find() with AND containing nested OR
+  // -----------------------------------------------------------------------
+  const nestedAndOrResults = await client.find(serieType)
+    .and([
+      { OR: [
+        SimfinityClient.condition('categories', 'EQ', 'Drama'),
+        SimfinityClient.condition('categories', 'EQ', 'Comedy'),
+      ]},
+    ])
+    .fields('id name categories')
+    .exec();
+  log('30. find() -- AND with nested OR groups', nestedAndOrResults);
+
+  // -----------------------------------------------------------------------
+  // 31. aggregate() with OR filter
+  // -----------------------------------------------------------------------
+  const aggOrResults = await client.aggregate(seasonType)
+    .groupBy('serie')
+    .fact('COUNT', 'seasonCount', 'id')
+    .or([
+      SimfinityClient.condition('year', 'GTE', 2020),
+      SimfinityClient.condition('year', 'LTE', 2010),
+    ])
+    .exec();
+  log('31. aggregate() -- OR filter (year >= 2020 OR year <= 2010)', aggOrResults);
+
   console.log('\n' + '='.repeat(60));
   console.log('Demo complete.');
   console.log('='.repeat(60));

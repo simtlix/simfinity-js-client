@@ -227,6 +227,30 @@ class QueryBuilder {
     return this;
   }
 
+  or(groups) {
+    if (!Array.isArray(groups)) {
+      throw new Error('or() expects an array of QLFilterGroup objects');
+    }
+    if (this._variables.OR) {
+      this._variables.OR.push(...groups);
+    } else {
+      this._variables.OR = [...groups];
+    }
+    return this;
+  }
+
+  and(groups) {
+    if (!Array.isArray(groups)) {
+      throw new Error('and() expects an array of QLFilterGroup objects');
+    }
+    if (this._variables.AND) {
+      this._variables.AND.push(...groups);
+    } else {
+      this._variables.AND = [...groups];
+    }
+    return this;
+  }
+
   // -- Relation Field Selection --------------------------------------------
 
   joinCollection(path, fields, filter) {
@@ -414,6 +438,30 @@ class AggregateBuilder {
       const filter = { operator: operatorOrTerms, value };
       if (value2 !== undefined) filter.value2 = value2;
       this._variables[field] = filter;
+    }
+    return this;
+  }
+
+  or(groups) {
+    if (!Array.isArray(groups)) {
+      throw new Error('or() expects an array of QLFilterGroup objects');
+    }
+    if (this._variables.OR) {
+      this._variables.OR.push(...groups);
+    } else {
+      this._variables.OR = [...groups];
+    }
+    return this;
+  }
+
+  and(groups) {
+    if (!Array.isArray(groups)) {
+      throw new Error('and() expects an array of QLFilterGroup objects');
+    }
+    if (this._variables.AND) {
+      this._variables.AND.push(...groups);
+    } else {
+      this._variables.AND = [...groups];
     }
     return this;
   }
@@ -1338,5 +1386,13 @@ export default class SimfinityClient {
     if (!this._initialized) {
       throw new Error('Client not initialized. Call init() first.');
     }
+  }
+
+  // -- Static Helpers -------------------------------------------------------
+
+  static condition(field, operator, value, path) {
+    const cond = { field, operator, value };
+    if (path !== undefined) cond.path = path;
+    return { conditions: [cond] };
   }
 }
